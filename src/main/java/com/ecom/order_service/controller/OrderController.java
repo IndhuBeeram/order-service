@@ -3,8 +3,9 @@ package com.ecom.order_service.controller;
 import com.ecom.order_service.OrderService.OrderService;
 import com.ecom.order_service.dto.OrderRequest;
 import com.ecom.order_service.dto.OrderResponse;
+
 import jakarta.validation.Valid;
-import org.springframework.http.HttpStatus;
+
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -16,60 +17,96 @@ public class OrderController {
 
     private final OrderService orderService;
 
-    public OrderController(OrderService orderService) {
+    public OrderController(
+            OrderService orderService) {
+
         this.orderService = orderService;
     }
 
-    // Create Order
+
+    // =========================
+    // CREATE ORDER
+    // =========================
+
     @PostMapping
     public ResponseEntity<OrderResponse> createOrder(
+            @RequestHeader("X-User-Id") Long userId,
             @Valid @RequestBody OrderRequest request) {
 
-        OrderResponse response = orderService.createOrder(request);
-
-        return new ResponseEntity<>(
-                response,
-                HttpStatus.CREATED
+        return ResponseEntity.ok(
+                orderService.createOrder(
+                        userId,
+                        request
+                )
         );
     }
 
-    // Get All Orders
+
+    // =========================
+    // GET MY ORDERS
+    // =========================
+
     @GetMapping
-    public ResponseEntity<List<OrderResponse>> getAllOrders() {
+    public ResponseEntity<List<OrderResponse>> getMyOrders(
+            @RequestHeader("X-User-Id") Long userId) {
 
         return ResponseEntity.ok(
-                orderService.getAllOrders()
+                orderService.getOrdersByUserId(userId)
         );
     }
 
-    // Get Order By ID
+
+    // =========================
+    // GET MY ORDER BY ID
+    // =========================
+
     @GetMapping("/{id}")
     public ResponseEntity<OrderResponse> getOrderById(
+            @RequestHeader("X-User-Id") Long userId,
             @PathVariable Long id) {
 
         return ResponseEntity.ok(
-                orderService.getOrderById(id)
+                orderService.getOrderById(
+                        userId,
+                        id
+                )
         );
     }
 
-    // Update Order Status
+
+    // =========================
+    // UPDATE ORDER STATUS
+    // =========================
+
     @PutMapping("/{id}/status")
     public ResponseEntity<OrderResponse> updateOrderStatus(
             @PathVariable Long id,
             @RequestParam String status) {
 
         return ResponseEntity.ok(
-                orderService.updateOrderStatus(id, status)
+                orderService.updateOrderStatus(
+                        id,
+                        status
+                )
         );
     }
 
-    // Cancel Order
+
+    // =========================
+    // CANCEL MY ORDER
+    // =========================
+
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> cancelOrder(
+            @RequestHeader("X-User-Id") Long userId,
             @PathVariable Long id) {
 
-        orderService.cancelOrder(id);
+        orderService.cancelOrder(
+                userId,
+                id
+        );
 
-        return ResponseEntity.noContent().build();
+        return ResponseEntity.noContent()
+                .build();
     }
 }

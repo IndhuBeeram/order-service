@@ -3,6 +3,8 @@ package com.ecom.order_service.event;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
+import com.ecom.order_service.entity.PaymentType;
+
 
 public class OrderCreatedEvent {
 
@@ -15,6 +17,8 @@ public class OrderCreatedEvent {
     private List<OrderCreatedItem> items;
 
     private LocalDateTime orderDate;
+
+    private PaymentType paymentType;
 
     public OrderCreatedEvent() {
     }
@@ -71,6 +75,12 @@ public class OrderCreatedEvent {
 
     public void setOrderDate(LocalDateTime orderDate) {
         this.orderDate = orderDate;
+    }
+    public PaymentType getPaymentType() {
+        return paymentType;
+    }
+    public void setPaymentType(PaymentType paymentType) {
+        this.paymentType = paymentType;
     }
 
 

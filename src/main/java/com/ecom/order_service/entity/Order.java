@@ -16,6 +16,9 @@ public class Order {
     private Long id;
 
     @Column(nullable = false)
+    private Long addressId;
+
+    @Column(nullable = false)
     private Long userId;
 
     @Column(nullable = false, precision = 12, scale = 2)
@@ -27,6 +30,10 @@ public class Order {
 
     @Column(nullable = false, updatable = false)
     private LocalDateTime orderDate;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "payment_type", nullable = false)
+    private PaymentType paymentType;
 
     @OneToMany(
             mappedBy = "order",
@@ -89,5 +96,20 @@ public class Order {
 
     public void setOrderItems(List<OrderItem> orderItems) {
         this.orderItems = orderItems;
+    }
+    public PaymentType getPaymentType() {
+    return paymentType;
+    }
+
+    public void setPaymentType(PaymentType paymentType) {
+        this.paymentType = paymentType;
+    }
+
+    public Long getAddressId() {
+    return addressId;
+    }
+
+    public void setAddressId(Long addressId) {
+        this.addressId = addressId;
     }
 }

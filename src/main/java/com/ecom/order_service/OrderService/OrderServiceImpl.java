@@ -9,13 +9,15 @@ import com.ecom.order_service.dto.ProductResponse;
 import com.ecom.order_service.entity.Order;
 import com.ecom.order_service.entity.OrderItem;
 import com.ecom.order_service.entity.OrderStatus;
-import com.ecom.order_service.exception.*;
+import com.ecom.order_service.event.OrderCreatedEvent;
+import com.ecom.order_service.exception.InvalidOrderStatusException;
+import com.ecom.order_service.exception.OrderNotFoundException;
 import com.ecom.order_service.repository.OrderRepository;
-import feign.FeignException;
+
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import com.ecom.order_service.event.OrderCreatedEvent;
-import com.ecom.order_service.producer.OrderEventProducer;
+
 import java.math.BigDecimal;
 import java.util.List;
 
@@ -24,15 +26,18 @@ public class OrderServiceImpl implements OrderService {
 
     private final OrderRepository orderRepository;
     private final ProductClient productClient;
-    private final OrderEventProducer orderEventProducer;
+    private final KafkaTemplate<String, OrderCreatedEvent> kafkaTemplate;
+
+    private static final String ORDER_CREATED_TOPIC = "order-created";
+
     public OrderServiceImpl(
             OrderRepository orderRepository,
             ProductClient productClient,
-            OrderEventProducer orderEventProducer) {
+            KafkaTemplate<String, OrderCreatedEvent> kafkaTemplate) {
 
         this.orderRepository = orderRepository;
         this.productClient = productClient;
-        this.orderEventProducer = orderEventProducer;
+        this.kafkaTemplate = kafkaTemplate;
     }
 
     // =========================================================
@@ -41,82 +46,77 @@ public class OrderServiceImpl implements OrderService {
 
     @Override
     @Transactional
-    public OrderResponse createOrder(OrderRequest request) {
+    public OrderResponse createOrder(
+            Long userId,
+            OrderRequest request) {
 
         Order order = new Order();
 
-        order.setUserId(request.getUserId());
+        // User ID comes from X-User-Id header
+        order.setUserId(userId);
+        order.setAddressId(request.getAddressId());
+        order.setPaymentType(request.getPaymentType());
 
-        // New orders always start with PENDING status
+
+        // New order starts as PENDING
         order.setStatus(OrderStatus.PENDING);
 
         BigDecimal totalAmount = BigDecimal.ZERO;
 
+        // =====================================================
+        // CREATE ORDER ITEMS
+        // =====================================================
+
         for (OrderItemRequest itemRequest : request.getItems()) {
 
-            // -------------------------------------------------
-            // Get product details from Product Service
-            // -------------------------------------------------
+            // Get product from Product Service
+            ProductResponse product =
+                    productClient.getProductById(
+                            itemRequest.getProductId()
+                    );
 
-            ProductResponse product;
+            // Product not found
+            if (product == null) {
 
-            try {
-
-                product = productClient.getProductById(
-                        itemRequest.getProductId()
-                );
-
-            } catch (FeignException.NotFound ex) {
-
-                throw new ProductNotFoundException(
+                throw new RuntimeException(
                         "Product not found with id: "
                                 + itemRequest.getProductId()
                 );
             }
 
-            // -------------------------------------------------
-            // Check whether product is active
-            // -------------------------------------------------
+            // Product must be active
+           if (!Boolean.TRUE.equals(product.getActive())) {
 
-            if (product.getActive() == null ||
-                    !product.getActive()) {
-
-                throw new ProductInactiveException(
-                        "Product is not available: "
+                throw new RuntimeException(
+                        "Product is not active with id: "
                                 + itemRequest.getProductId()
                 );
             }
 
-            // -------------------------------------------------
-            // Calculate subtotal
-            // -------------------------------------------------
-
-            BigDecimal subtotal =
-                    product.getPrice()
-                            .multiply(
-                                    BigDecimal.valueOf(
-                                            itemRequest.getQuantity()
-                                    )
-                            );
-
-            // -------------------------------------------------
-            // Create OrderItem
-            // -------------------------------------------------
+            // =================================================
+            // CREATE ORDER ITEM
+            // =================================================
 
             OrderItem orderItem = new OrderItem();
 
-            orderItem.setProductId(
-                    itemRequest.getProductId()
-            );
+            orderItem.setProductId(product.getId());
 
             orderItem.setQuantity(
                     itemRequest.getQuantity()
             );
 
-            // Store price at the time of purchase
-            orderItem.setPrice(
-                    product.getPrice()
-            );
+            // Get current product price
+            BigDecimal price = product.getPrice();
+
+            orderItem.setPrice(price);
+
+            // Calculate subtotal
+            BigDecimal subtotal =
+                    price.multiply(
+                            BigDecimal.valueOf(
+                                    itemRequest.getQuantity()
+                            )
+                    );
 
             orderItem.setSubtotal(subtotal);
 
@@ -125,32 +125,22 @@ public class OrderServiceImpl implements OrderService {
 
             order.getOrderItems().add(orderItem);
 
-            // Add item subtotal to total order amount
-            totalAmount =
-                    totalAmount.add(subtotal);
+            // Add to order total
+            totalAmount = totalAmount.add(subtotal);
         }
-
-        // -----------------------------------------------------
-        // Set final order total
-        // -----------------------------------------------------
 
         order.setTotalAmount(totalAmount);
 
-        // -----------------------------------------------------
-        // Save Order
-        // -----------------------------------------------------
+        // =====================================================
+        // SAVE ORDER
+        // =====================================================
 
         Order savedOrder =
                 orderRepository.save(order);
 
-// Create Kafka event
-        OrderCreatedEvent event =
-                new OrderCreatedEvent();
-
-        event.setOrderId(savedOrder.getId());
-        event.setUserId(savedOrder.getUserId());
-        event.setTotalAmount(savedOrder.getTotalAmount());
-        event.setOrderDate(savedOrder.getOrderDate());
+        // =====================================================
+        // CREATE KAFKA EVENT ITEMS
+        // =====================================================
 
         List<OrderCreatedEvent.OrderCreatedItem> eventItems =
                 savedOrder.getOrderItems()
@@ -165,12 +155,35 @@ public class OrderServiceImpl implements OrderService {
                         )
                         .toList();
 
-        event.setItems(eventItems);
+        // =====================================================
+        // CREATE KAFKA EVENT
+        // =====================================================
 
-// Publish event to Kafka
-        orderEventProducer.publishOrderCreatedEvent(event);
+        OrderCreatedEvent event =
+                new OrderCreatedEvent(
+                        savedOrder.getId(),
+                        savedOrder.getUserId(),
+                        savedOrder.getTotalAmount(),
+                        eventItems,
+                        savedOrder.getOrderDate()
+                );
 
-// Convert Entity → Response DTO
+        // Your Event class has paymentType as a field,
+        // but it is not included in the constructor.
+        event.setPaymentType(
+                savedOrder.getPaymentType()
+        );
+
+        // =====================================================
+        // PUBLISH EVENT TO KAFKA
+        // =====================================================
+
+        kafkaTemplate.send(
+                ORDER_CREATED_TOPIC,
+                String.valueOf(savedOrder.getId()),
+                event
+        );
+
         return mapToResponse(savedOrder);
     }
 
@@ -180,18 +193,47 @@ public class OrderServiceImpl implements OrderService {
     // =========================================================
 
     @Override
-    public OrderResponse getOrderById(Long id) {
+    @Transactional(readOnly = true)
+    public OrderResponse getOrderById(
+            Long userId,
+            Long orderId) {
 
         Order order =
-                orderRepository.findById(id)
+                orderRepository.findById(orderId)
                         .orElseThrow(() ->
                                 new OrderNotFoundException(
                                         "Order not found with id: "
-                                                + id
+                                                + orderId
                                 )
                         );
 
+        // User can access only their own order
+        if (!order.getUserId().equals(userId)) {
+
+            throw new OrderNotFoundException(
+                    "Order not found with id: "
+                            + orderId
+            );
+        }
+
         return mapToResponse(order);
+    }
+
+
+    // =========================================================
+    // GET ORDERS BY USER ID
+    // =========================================================
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<OrderResponse> getOrdersByUserId(
+            Long userId) {
+
+        return orderRepository
+                .findByUserId(userId)
+                .stream()
+                .map(this::mapToResponse)
+                .toList();
     }
 
 
@@ -200,9 +242,11 @@ public class OrderServiceImpl implements OrderService {
     // =========================================================
 
     @Override
+    @Transactional(readOnly = true)
     public List<OrderResponse> getAllOrders() {
 
-        return orderRepository.findAll()
+        return orderRepository
+                .findAll()
                 .stream()
                 .map(this::mapToResponse)
                 .toList();
@@ -214,13 +258,10 @@ public class OrderServiceImpl implements OrderService {
     // =========================================================
 
     @Override
+    @Transactional
     public OrderResponse updateOrderStatus(
             Long id,
             String status) {
-
-        // -----------------------------------------------------
-        // Find order
-        // -----------------------------------------------------
 
         Order order =
                 orderRepository.findById(id)
@@ -231,17 +272,6 @@ public class OrderServiceImpl implements OrderService {
                                 )
                         );
 
-        // -----------------------------------------------------
-        // Get current status
-        // -----------------------------------------------------
-
-        OrderStatus currentStatus =
-                order.getStatus();
-
-        // -----------------------------------------------------
-        // Convert request String → OrderStatus enum
-        // -----------------------------------------------------
-
         OrderStatus newStatus;
 
         try {
@@ -251,32 +281,70 @@ public class OrderServiceImpl implements OrderService {
                             status.toUpperCase()
                     );
 
-        } catch (IllegalArgumentException ex) {
+        } catch (IllegalArgumentException e) {
 
             throw new InvalidOrderStatusException(
-                    "Invalid order status: " + status
+                    "Invalid order status: "
+                            + status
             );
         }
 
-        // -----------------------------------------------------
-        // Validate status transition
-        // -----------------------------------------------------
+        OrderStatus currentStatus =
+                order.getStatus();
 
-        if (!isValidStatusTransition(
-                currentStatus,
-                newStatus)) {
+        boolean validTransition = false;
+
+        // =====================================================
+        // STATUS TRANSITIONS
+        // =====================================================
+
+        switch (currentStatus) {
+
+            case PENDING:
+
+                if (newStatus == OrderStatus.CONFIRMED
+                        || newStatus == OrderStatus.CANCELLED) {
+
+                    validTransition = true;
+                }
+
+                break;
+
+            case CONFIRMED:
+
+                if (newStatus == OrderStatus.SHIPPED) {
+
+                    validTransition = true;
+                }
+
+                break;
+
+            case SHIPPED:
+
+                if (newStatus == OrderStatus.DELIVERED) {
+
+                    validTransition = true;
+                }
+
+                break;
+
+            case CANCELLED:
+            case DELIVERED:
+
+                validTransition = false;
+
+                break;
+        }
+
+        if (!validTransition) {
 
             throw new InvalidOrderStatusException(
-                    "Invalid order status transition: "
+                    "Cannot change order status from "
                             + currentStatus
-                            + " → "
+                            + " to "
                             + newStatus
             );
         }
-
-        // -----------------------------------------------------
-        // Update status
-        // -----------------------------------------------------
 
         order.setStatus(newStatus);
 
@@ -292,78 +360,48 @@ public class OrderServiceImpl implements OrderService {
     // =========================================================
 
     @Override
-    public void cancelOrder(Long id) {
-
-        // -----------------------------------------------------
-        // Find order
-        // -----------------------------------------------------
+    @Transactional
+    public void cancelOrder(
+            Long userId,
+            Long orderId) {
 
         Order order =
-                orderRepository.findById(id)
+                orderRepository.findById(orderId)
                         .orElseThrow(() ->
                                 new OrderNotFoundException(
                                         "Order not found with id: "
-                                                + id
+                                                + orderId
                                 )
                         );
 
-        // -----------------------------------------------------
-        // Get current status
-        // -----------------------------------------------------
+        // User can cancel only their own order
+        if (!order.getUserId().equals(userId)) {
 
-        OrderStatus currentStatus =
-                order.getStatus();
-
-        // -----------------------------------------------------
-        // Cancellation is allowed only for PENDING orders
-        // -----------------------------------------------------
-
-        if (currentStatus != OrderStatus.PENDING) {
-
-            throw new InvalidOrderStatusException(
-                    "Order cannot be cancelled when current status is: "
-                            + currentStatus
+            throw new OrderNotFoundException(
+                    "Order not found with id: "
+                            + orderId
             );
         }
 
-        // -----------------------------------------------------
-        // Change status to CANCELLED
-        // -----------------------------------------------------
+        // Only PENDING orders can be cancelled
+        if (order.getStatus()
+                != OrderStatus.PENDING) {
 
-        order.setStatus(OrderStatus.CANCELLED);
+            throw new InvalidOrderStatusException(
+                    "Only PENDING orders can be cancelled"
+            );
+        }
+
+        order.setStatus(
+                OrderStatus.CANCELLED
+        );
 
         orderRepository.save(order);
     }
 
 
     // =========================================================
-    // VALIDATE ORDER STATUS TRANSITION
-    // =========================================================
-
-    private boolean isValidStatusTransition(
-            OrderStatus currentStatus,
-            OrderStatus newStatus) {
-
-        return switch (currentStatus) {
-
-            case PENDING ->
-                    newStatus == OrderStatus.CONFIRMED
-                            || newStatus == OrderStatus.CANCELLED;
-
-            case CONFIRMED ->
-                    newStatus == OrderStatus.SHIPPED;
-
-            case SHIPPED ->
-                    newStatus == OrderStatus.DELIVERED;
-
-            case CANCELLED, DELIVERED ->
-                    false;
-        };
-    }
-
-
-    // =========================================================
-    // MAP ORDER → ORDER RESPONSE
+    // ENTITY → ORDER RESPONSE
     // =========================================================
 
     private OrderResponse mapToResponse(
@@ -384,13 +422,20 @@ public class OrderServiceImpl implements OrderService {
                 order.getTotalAmount()
         );
 
-        // Enum → String for API response
+        /*
+         * Your OrderResponse.setStatus() expects String,
+         * while Order entity contains OrderStatus.
+         */
         response.setStatus(
                 order.getStatus().name()
         );
 
         response.setOrderDate(
                 order.getOrderDate()
+        );
+
+        response.setPaymentType(
+                order.getPaymentType()
         );
 
         List<OrderItemResponse> itemResponses =
@@ -408,7 +453,7 @@ public class OrderServiceImpl implements OrderService {
 
 
     // =========================================================
-    // MAP ORDER ITEM → RESPONSE
+    // ORDER ITEM → ORDER ITEM RESPONSE
     // =========================================================
 
     private OrderItemResponse mapItemToResponse(
